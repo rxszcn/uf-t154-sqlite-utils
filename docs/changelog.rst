@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_2_2:
+
+4.2.2 (unreleased)
+------------------
+
+- Detected CSV/TSV column types are still skipped for tables that already exist, but the skip is no longer silent: ``insert`` and ``upsert`` now write a warning to standard error containing the stable marker ``detected-types-skipped``, the table name and the detected types. Standard output is unchanged. The new ``--apply-detected-types`` flag opts in to applying detected types to an existing table, for pipelines where an earlier import created every column as ``TEXT``. ``--type`` overrides still take precedence and the transform only runs when a column type would actually change. ``insert_upsert_implementation`` and the ``insert``/``upsert`` commands now also return a ``sqlite_utils.utils.TypeDetectionOutcome`` describing what happened, readable via ``CliRunner.invoke(..., standalone_mode=False).return_value``.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

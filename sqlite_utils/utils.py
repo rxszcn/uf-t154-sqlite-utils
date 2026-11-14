@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -453,6 +454,38 @@ class TypeTracker:
         to the ``db[table_name].transform(types=tracker.types)`` method.
         """
         return {key: tracker.guessed_type for key, tracker in self.trackers.items()}
+
+
+@dataclass
+class TypeDetectionOutcome:
+    """
+    Record of what happened to the types detected by a :class:`TypeTracker`.
+
+    The CLI only applies detected types to a table that it created itself. When
+    the target table already existed the detected types are skipped, unless the
+    caller explicitly opts in. This object makes that decision observable in
+    code instead of only through the warning written to standard error.
+
+    :ivar table: Name of the table the detected types belong to
+    :ivar table_existed: ``True`` if the table existed before the insert
+    :ivar detected_types: Types detected from the input rows, including any
+      ``--type`` overrides
+    :ivar applied_types: Column types that were actually applied, if any
+    :ivar reason: One of ``table_created``, ``applied_to_existing_table``,
+      ``already_matches``, ``skipped_existing_table``, ``nothing_detected``
+      or ``no_rows``
+    """
+
+    table: str | None = None
+    table_existed: bool = False
+    detected_types: dict[str, str] = field(default_factory=dict)
+    applied_types: dict[str, str] = field(default_factory=dict)
+    reason: str = "no_rows"
+
+    @property
+    def skipped(self) -> bool:
+        "``True`` if detected types were skipped because the table already existed"
+        return self.reason == "skipped_existing_table"
 
 
 class ValueTracker:

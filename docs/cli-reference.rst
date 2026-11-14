@@ -312,6 +312,8 @@ See :ref:`cli_inserting_data`, :ref:`cli_insert_csv_tsv`, :ref:`cli_insert_unstr
       --default <TEXT TEXT>...  Default value that should be set for a column
       --type <TEXT CHOICE>...   Column types to use when creating the table
       --no-detect-types         Treat all CSV/TSV columns as TEXT
+      --apply-detected-types    Apply detected CSV/TSV types to a table that already
+                                exists
       --analyze                 Run ANALYZE at the end of this operation
       --load-extension TEXT     Path to SQLite extension, with optional :entrypoint
       --silent                  Do not show progress bar
@@ -376,6 +378,8 @@ See :ref:`cli_upsert`.
       --default <TEXT TEXT>...  Default value that should be set for a column
       --type <TEXT CHOICE>...   Column types to use when creating the table
       --no-detect-types         Treat all CSV/TSV columns as TEXT
+      --apply-detected-types    Apply detected CSV/TSV types to a table that already
+                                exists
       --analyze                 Run ANALYZE at the end of this operation
       --load-extension TEXT     Path to SQLite extension, with optional :entrypoint
       --silent                  Do not show progress bar

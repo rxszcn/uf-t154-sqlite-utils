@@ -1347,6 +1347,28 @@ By default, column types are automatically detected for CSV or TSV files - resul
 
 Detected types are only applied when the table is created by the command. Inserting CSV or TSV data into a table that already exists leaves the existing column types unchanged - values are inserted using the table's existing schema.
 
+When that skip happens the command writes a warning to standard error containing the stable marker ``detected-types-skipped``, the table name and the types that were detected. Standard output is left untouched, so piping or capturing the command's output is unaffected:
+
+.. code-block:: output
+
+    Warning: detected column types for table "orders" were not applied because the table already exists (detected-types-skipped). Detected: id=integer, qty=integer, price=float, zip=integer. Use --apply-detected-types to apply them.
+
+This makes the skip detectable from a shell pipeline without parsing the rest of the message:
+
+.. code-block:: bash
+
+    sqlite-utils insert data.db orders orders.csv --csv 2>&1 | grep -q detected-types-skipped && echo "types were skipped"
+
+If you have verified that rewriting the column types of the existing table is safe for your data, pass ``--apply-detected-types`` to apply them anyway:
+
+.. code-block:: bash
+
+    sqlite-utils insert data.db orders orders.csv --csv --apply-detected-types
+
+This was added for pipelines where an earlier import created every column as ``TEXT`` using ``--no-detect-types``. Re-running the import with ``--apply-detected-types`` converts those columns to the detected ``INTEGER`` and ``REAL`` types. The option is off by default because the transform rewrites every stored value: text such as a ZIP code ``01234`` in a column detected as ``integer`` will be converted to ``1234``, losing the leading zero. Only enable it when the detected types are known to be correct for the existing data.
+
+``--type column-name type`` overrides always win over detected types, including when ``--apply-detected-types`` is used. The transform only runs if at least one column type would actually change.
+
 For example, given a ``creatures.csv`` file containing this:
 
 .. code-block::

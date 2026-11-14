@@ -727,6 +727,239 @@ def test_upsert_csv_detect_types_leaves_existing_table_alone(db_path):
     assert db.table("places").get(1)["zip"] == "01234"
 
 
+@pytest.mark.parametrize(
+    "command,extra_args,input_text",
+    (
+        ("insert", [], "zip,score\n01234,9.5\n"),
+        ("upsert", ["--pk", "id"], "id,zip,score\n2,01234,9.5\n"),
+    ),
+)
+def test_skip_emits_machine_readable_signal(db_path, command, extra_args, input_text):
+    # The default skip must stay silent on stdout (so piped output is
+    # unaffected) but must write a stable marker to stderr so that a
+    # pipeline can detect that detected types were not applied.
+    db = Database(db_path)
+    if command == "upsert":
+        db.table("places").insert({"id": 1, "zip": "00001", "score": "1.5"}, pk="id")
+    else:
+        db.table("places").insert({"zip": "00001", "score": "1.5"})
+    result = CliRunner().invoke(
+        cli.cli,
+        [command, db_path, "places", "-", "--csv"] + extra_args,
+        catch_exceptions=False,
+        input=input_text,
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert cli.DETECTED_TYPES_SKIPPED in result.stderr
+    assert "already exists" in result.stderr
+    assert "--apply-detected-types" in result.stderr
+    # Nothing was changed on the table
+    assert db.table("places").columns_dict["zip"] is str
+
+
+@pytest.mark.parametrize(
+    "command,extra_args,input_text,expected",
+    (
+        (
+            "insert",
+            [],
+            "id,qty,price,zip\n2,3,9.5,00123\n",
+            {"id": int, "qty": int, "price": float, "zip": int},
+        ),
+        (
+            "upsert",
+            ["--pk", "id"],
+            "id,qty,price,zip\n2,3,9.5,00123\n",
+            {"id": int, "qty": int, "price": float, "zip": int},
+        ),
+    ),
+)
+def test_apply_detected_types_to_existing_table(
+    db_path, command, extra_args, input_text, expected
+):
+    # --apply-detected-types is the explicit opt-in for rewriting the types
+    # of a table that already exists, which is what a pipeline needs when an
+    # earlier import created every column as TEXT.
+    db = Database(db_path)
+    db.table("orders").create(
+        {"id": str, "qty": str, "price": str, "zip": str},
+        pk="id" if command == "upsert" else None,
+    )
+    db.table("orders").insert({"id": "1", "qty": "5", "price": "12.5", "zip": "01234"})
+    result = CliRunner().invoke(
+        cli.cli,
+        [command, db_path, "orders", "-", "--csv", "--apply-detected-types"]
+        + extra_args,
+        catch_exceptions=False,
+        input=input_text,
+    )
+    assert result.exit_code == 0, result.output
+    # No skip warning when the caller explicitly asked for the types
+    assert cli.DETECTED_TYPES_SKIPPED not in result.stderr
+    assert result.stderr == ""
+    assert db.table("orders").columns_dict == expected
+    # Existing rows were converted by the transform
+    assert db.table("orders").get(1)["qty"] == 5
+
+
+def test_apply_detected_types_preserves_type_overrides(db_path):
+    # --type always wins over a detected type, even when
+    # --apply-detected-types rewrites the rest of the schema
+    db = Database(db_path)
+    db.table("places").create({"zip": str, "score": str})
+    db.table("places").insert({"zip": "01234", "score": "9.5"})
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "insert",
+            db_path,
+            "places",
+            "-",
+            "--csv",
+            "--apply-detected-types",
+            "--type",
+            "zip",
+            "text",
+        ],
+        catch_exceptions=False,
+        input="zip,score\n00012,8.5\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert db.table("places").columns_dict == {"zip": str, "score": float}
+    assert db.table("places").get(1)["zip"] == "01234"
+
+
+def test_apply_detected_types_noop_when_already_matching(db_path):
+    # Nothing to change means no transform - the table must be left intact
+    db = Database(db_path)
+    db.table("places").create({"name": str, "score": float})
+    db.table("places").insert({"name": "Boston", "score": 9.5})
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "places", "-", "--csv", "--apply-detected-types"],
+        catch_exceptions=False,
+        input="name,score\nSF,8.5\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert db.table("places").columns_dict == {"name": str, "score": float}
+
+
+def test_apply_detected_types_with_no_detect_types_is_inert(db_path):
+    # --no-detect-types means there is no detected type to apply
+    db = Database(db_path)
+    db.table("places").create({"zip": str})
+    db.table("places").insert({"zip": "01234"})
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "insert",
+            db_path,
+            "places",
+            "-",
+            "--csv",
+            "--no-detect-types",
+            "--apply-detected-types",
+        ],
+        catch_exceptions=False,
+        input="zip\n00012\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert db.table("places").columns_dict == {"zip": str}
+
+
+def test_apply_detected_types_leaves_leading_zeros_alone_when_detected_as_text(
+    db_path,
+):
+    # When the detected type for a column is TEXT (mixed values) the opt-in
+    # flag must not force a numeric type onto it
+    db = Database(db_path)
+    db.table("places").create({"code": str})
+    db.table("places").insert({"code": "01234"})
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "places", "-", "--csv", "--apply-detected-types"],
+        catch_exceptions=False,
+        input="code\n00123\nabc\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert db.table("places").columns_dict == {"code": str}
+    assert [row["code"] for row in db.table("places").rows] == ["01234", "00123", "abc"]
+
+
+def test_apply_detected_types_new_table_matches_default(db_path):
+    # The flag must not change anything when the command creates the table
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "data", "-", "--csv", "--apply-detected-types"],
+        catch_exceptions=False,
+        input="name,age,weight\nCleo,5,12.5",
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    db = Database(db_path)
+    assert db.table("data").columns_dict == {"name": str, "age": int, "weight": float}
+    assert db.table("data").schema == (
+        'CREATE TABLE "data" (\n'
+        '   "name" TEXT,\n'
+        '   "age" INTEGER,\n'
+        '   "weight" REAL\n'
+        ")"
+    )
+
+
+def test_type_detection_outcome_is_programmatically_readable(db_path):
+    # The decision is available as structured data, not just as a warning on
+    # stderr - useful for callers that drive the CLI from Python
+    db = Database(db_path)
+    db.table("places").insert({"zip": "01234"})
+
+    skipped = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "places", "-", "--csv"],
+        catch_exceptions=False,
+        input="zip\n00012\n",
+        standalone_mode=False,
+    )
+    assert skipped.exit_code == 0
+    # click's type stubs omit Result.return_value, which click sets when
+    # standalone_mode=False
+    outcome = getattr(skipped, "return_value")
+    assert outcome.skipped is True
+    assert outcome.reason == "skipped_existing_table"
+    assert outcome.table == "places"
+    assert outcome.table_existed is True
+    assert outcome.detected_types == {"zip": "integer"}
+    assert outcome.applied_types == {}
+
+    applied = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "places", "-", "--csv", "--apply-detected-types"],
+        catch_exceptions=False,
+        input="zip\n00012\n",
+        standalone_mode=False,
+    )
+    assert applied.exit_code == 0
+    outcome = getattr(applied, "return_value")
+    assert outcome.skipped is False
+    assert outcome.reason == "applied_to_existing_table"
+    assert outcome.applied_types == {"zip": "INTEGER"}
+
+    created = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "new_table", "-", "--csv"],
+        catch_exceptions=False,
+        input="zip\n00012\n",
+        standalone_mode=False,
+    )
+    assert created.exit_code == 0
+    outcome = getattr(created, "return_value")
+    assert outcome.reason == "table_created"
+    assert outcome.table_existed is False
+
+
 def test_insert_invalid_pk_clean_error(db_path):
     # An invalid --pk against an existing table should be a clean CLI
     # error, not a raw InvalidColumns traceback

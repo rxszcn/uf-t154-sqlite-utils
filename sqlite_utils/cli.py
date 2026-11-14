@@ -22,6 +22,7 @@ from click_default_group import DefaultGroup
 import sqlite_utils
 from sqlite_utils import recipes
 from sqlite_utils.db import (
+    COLUMN_TYPE_MAPPING,
     DEFAULT,
     AlterError,
     BadMultiValues,
@@ -31,6 +32,7 @@ from sqlite_utils.db import (
     NoView,
     PrimaryKeyRequired,
     quote_identifier,
+    resolve_casing,
 )
 from sqlite_utils.plugins import ensure_plugins_loaded, get_plugins, pm
 from sqlite_utils.utils import maximize_csv_field_size_limit
@@ -38,9 +40,11 @@ from sqlite_utils.utils import maximize_csv_field_size_limit
 from .utils import (
     Format,
     OperationalError,
+    TypeDetectionOutcome,
     TypeTracker,
     _compile_code,
     chunks,
+    column_affinity,
     decode_base64_values,
     dedupe_keys,
     file_progress,
@@ -77,6 +81,37 @@ def _close_databases(ctx):
 
 
 VALID_COLUMN_TYPES = ("INTEGER", "TEXT", "FLOAT", "REAL", "BLOB", "ANY")
+
+# Stable marker written to standard error when detected column types are
+# skipped because the target table already exists. Scripts can look for this
+# token to detect the skip without parsing the human-readable message.
+DETECTED_TYPES_SKIPPED = "detected-types-skipped"
+
+
+def _detected_types_that_differ(table, detected_types):
+    """
+    Return the subset of ``detected_types`` whose SQLite affinity differs from
+    the current type of the matching column in ``table``.
+
+    Columns that are not present in the table are ignored. This keeps
+    ``--apply-detected-types`` from rebuilding a table when nothing would
+    actually change.
+    """
+    existing_affinities = {
+        column.name: column_affinity(column.type or "") for column in table.columns
+    }
+    changes = {}
+    for column, detected_type in detected_types.items():
+        existing_name = resolve_casing(column, existing_affinities)
+        if existing_name not in existing_affinities:
+            continue
+        # Normalize the same way the create-table path does, so a detected
+        # "float" becomes REAL rather than the less specific FLOAT
+        declared_type = COLUMN_TYPE_MAPPING.get(detected_type) or detected_type.upper()
+        if existing_affinities[existing_name] != column_affinity(declared_type):
+            changes[existing_name] = declared_type
+    return changes
+
 
 UNICODE_ERROR = """
 {}
@@ -1038,6 +1073,13 @@ def insert_upsert_options(*, require_pk=False):
                     help="Treat all CSV/TSV columns as TEXT",
                 ),
                 click.option(
+                    "--apply-detected-types",
+                    is_flag=True,
+                    help=(
+                        "Apply detected CSV/TSV types to a table that already exists"
+                    ),
+                ),
+                click.option(
                     "--analyze",
                     is_flag=True,
                     help="Run ANALYZE at the end of this operation",
@@ -1088,6 +1130,7 @@ def insert_upsert_implementation(
     default=None,
     types=None,
     no_detect_types=False,
+    apply_detected_types=False,
     analyze=False,
     load_extension=None,
     silent=False,
@@ -1166,17 +1209,54 @@ def insert_upsert_implementation(
                 )
             else:
                 raise
-        # Apply detected types only to a table this command created -
-        # transforming a pre-existing table would rewrite its column types
-        # and corrupt values such as TEXT zip codes with leading zeros
-        if (
-            tracker is not None
-            and not table_existed_before_insert
-            and db.table(table).exists()
-        ):
+        # Apply detected types to a table this command created. By default a
+        # pre-existing table is left alone: transforming it would rewrite its
+        # column types and corrupt values such as TEXT zip codes with leading
+        # zeros. Callers who have verified this is safe for their data can opt
+        # in with --apply-detected-types.
+        if tracker is not None and db.table(table).exists():
             detected_types = tracker.types
             detected_types.update(column_type_overrides)
-            db.table(table).transform(types=detected_types)
+            outcome = TypeDetectionOutcome(
+                table=table,
+                table_existed=table_existed_before_insert,
+                detected_types=detected_types,
+            )
+            if not table_existed_before_insert:
+                db.table(table).transform(types=detected_types)
+                outcome.applied_types = detected_types
+                outcome.reason = "table_created"
+            elif apply_detected_types:
+                changed_types = _detected_types_that_differ(
+                    db.table(table), detected_types
+                )
+                if changed_types:
+                    db.table(table).transform(types=changed_types)
+                    outcome.applied_types = changed_types
+                    outcome.reason = "applied_to_existing_table"
+                else:
+                    outcome.reason = "already_matches"
+            elif detected_types:
+                outcome.reason = "skipped_existing_table"
+                click.echo(
+                    (
+                        'Warning: detected column types for table "{}" were not '
+                        "applied because the table already exists ({}). Detected: "
+                        "{}. Use --apply-detected-types to apply them."
+                    ).format(
+                        table,
+                        DETECTED_TYPES_SKIPPED,
+                        ", ".join(
+                            "{}={}".format(column, ctype)
+                            for column, ctype in detected_types.items()
+                        ),
+                    ),
+                    err=True,
+                )
+            else:
+                outcome.reason = "nothing_detected"
+            return outcome
+        return None
 
     if code is not None:
         if file is not None:
@@ -1202,7 +1282,7 @@ def insert_upsert_implementation(
                 "--code cannot be used with input format options"
             )
         _insert_docs(_rows_from_code(code))
-        return
+        return None
 
     if file is None:
         raise click.ClickException(
@@ -1314,13 +1394,14 @@ def insert_upsert_implementation(
             else:
                 docs = (fn(doc) or doc for doc in docs)
 
-        _insert_docs(docs, tracker=tracker)
+        outcome = _insert_docs(docs, tracker=tracker)
 
         # Clean up open file-like objects
         if sniff_buffer:
             sniff_buffer.close()
         if decoded_buffer:
             decoded_buffer.close()
+        return outcome
 
 
 def _find_variables(tb, vars):
@@ -1376,6 +1457,7 @@ def insert(
     stop_after,
     alter,
     no_detect_types,
+    apply_detected_types,
     analyze,
     load_extension,
     silent,
@@ -1446,7 +1528,7 @@ def insert(
         ' --pk id
     """
     try:
-        insert_upsert_implementation(
+        return insert_upsert_implementation(
             path,
             table,
             file,
@@ -1473,6 +1555,7 @@ def insert(
             replace=replace,
             truncate=truncate,
             no_detect_types=no_detect_types,
+            apply_detected_types=apply_detected_types,
             analyze=analyze,
             load_extension=load_extension,
             silent=silent,
@@ -1515,6 +1598,7 @@ def upsert(
     default,
     types,
     no_detect_types,
+    apply_detected_types,
     analyze,
     load_extension,
     silent,
@@ -1539,7 +1623,7 @@ def upsert(
         ]' | sqlite-utils upsert data.db chickens - --pk id
     """
     try:
-        insert_upsert_implementation(
+        return insert_upsert_implementation(
             path,
             table,
             file,
@@ -1566,6 +1650,7 @@ def upsert(
             default=default,
             types=types,
             no_detect_types=no_detect_types,
+            apply_detected_types=apply_detected_types,
             analyze=analyze,
             load_extension=load_extension,
             silent=silent,
